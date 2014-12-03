@@ -66,13 +66,16 @@ func runCommands(w http.ResponseWriter, bg bool,
 
 	for _, cmd := range cmds {
 		if exists(cmd.Path) {
-			log.Printf("Running %v in %v", cmd.Args, abspath)
+			if cmd.Dir == "" {
+				cmd.Dir = abspath
+			}
+			cmd.Stdout = stdout
+			cmd.Stderr = stderr
+
+			log.Printf("Running %v in %v", cmd.Args, cmd.Dir)
 			fmt.Fprintf(stdout, "# Running %v\n", cmd.Args)
 			fmt.Fprintf(stderr, "# Running %v\n", cmd.Args)
 
-			cmd.Stdout = stdout
-			cmd.Stderr = stderr
-			cmd.Dir = abspath
 			err := cmd.Run()
 
 			if err != nil {
@@ -203,10 +206,10 @@ func createRepo(w http.ResponseWriter, path string, repo_path string,
 		exec.Command(filepath.Join(*thePath, "bin/post-fetch")),
 	}
 
-	cmds[1].Stdin = bytes.NewBuffer(payload)
-	cmds[2].Stdin = bytes.NewBuffer(payload)
-	cmds[3].Stdin = bytes.NewBuffer(payload)
-	cmds[4].Stdin = bytes.NewBuffer(payload)
+	for i:=1; i<len(cmds); i++ {
+		cmds[i].Stdin = bytes.NewBuffer(payload)
+		cmds[i].Dir = abspath
+	}
 
 	return <-queueCommand(w, bg, "/tmp", cmds)
 }
