@@ -14,7 +14,6 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,7 +25,7 @@ var (
 	git     = flag.String("git", "/usr/bin/git", "path to git")
 	addr    = flag.String("addr", ":8124", "binding address to listen on")
 	secret  = flag.String("secret", "",
-		"Optional secret for authenticating hooks")
+	"Optional secret for authenticating hooks")
 )
 
 type commandRequest struct {
@@ -178,54 +177,38 @@ func updateGit(w http.ResponseWriter, section string,
 }
 
 func getPath(req *http.Request) string {
-	if qp := req.URL.Query().Get("name"); qp != "" {
-		return filepath.Clean(qp)
-	}
+	//	if qp := req.URL.Query().Get("name"); qp != "" {
+	//		return filepath.Clean(qp)
+	//	}
 	return filepath.Clean(filepath.FromSlash(req.URL.Path))[1:]
 }
 
-func createRepo(w http.ResponseWriter, section string,
-	bg bool, payload []byte) {
-
-	p := struct {
-		Repository struct {
-			Owner   interface{}
-			Private bool
-			Name    string
-		}
-	}{}
-
-	err := json.Unmarshal(payload, &p)
-	if err != nil {
-		log.Printf("Error unmarshalling data: %v", err)
-		http.Error(w, "Error parsing JSON", http.StatusInternalServerError)
-		return
+func createRepo(w http.ResponseWriter, path string, repo_path string,
+	private bool, bg bool, payload []byte) bool {
+	repo := fmt.Sprintf("git://github.com/%v.git",
+		repo_path)
+	if private {
+		repo = fmt.Sprintf("git@github.com:%v.git",
+			repo_path)
 	}
 
-	var ownerName string
-	switch i := p.Repository.Owner.(type) {
-	case string:
-		ownerName = i
-	case map[string]interface{}:
-		ownerName = fmt.Sprintf("%v", i["name"])
-	}
-
-	repo := fmt.Sprintf("git://github.com/%v/%v.git",
-		ownerName, p.Repository.Name)
-	if p.Repository.Private {
-		repo = fmt.Sprintf("git@github.com:%v/%v.git",
-			ownerName, p.Repository.Name)
-	}
+	abspath := filepath.Join(*thePath, path)
 
 	cmds := []*exec.Cmd{
 		exec.Command(*git, "clone", "--mirror", "--bare", repo,
-			filepath.Join(*thePath, section)),
+			filepath.Join(*thePath, path)),
+		exec.Command(filepath.Join(abspath, "hooks/post-clone")),
+		exec.Command(filepath.Join(*thePath, "bin/post-clone")),
+		exec.Command(filepath.Join(abspath, "hooks/post-fetch")),
+		exec.Command(filepath.Join(*thePath, "bin/post-fetch")),
 	}
 
-	if bg {
-		w.WriteHeader(201)
-	}
-	queueCommand(w, true, "/tmp", cmds)
+	cmds[1].Stdin = bytes.NewBuffer(payload)
+	cmds[2].Stdin = bytes.NewBuffer(payload)
+	cmds[3].Stdin = bytes.NewBuffer(payload)
+	cmds[4].Stdin = bytes.NewBuffer(payload)
+
+	return <-queueCommand(w, bg, "/tmp", cmds)
 }
 
 func doUpdate(w http.ResponseWriter, path string,
@@ -238,13 +221,23 @@ func doUpdate(w http.ResponseWriter, path string,
 	}
 }
 
+func doCreate(w http.ResponseWriter, path string, repo_path string,
+	private bool, bg bool, payload []byte) {
+	if bg {
+		go createRepo(w, path, repo_path, private, bg, payload)
+		w.WriteHeader(201)
+	} else {
+		createRepo(w, path, repo_path, private, bg, payload)
+	}
+}
+
 func handleGet(w http.ResponseWriter, req *http.Request, bg bool) {
 	doUpdate(w, getPath(req), bg, nil)
 }
 
 // parseForm parses an HTTP POST form from an io.Reader.
-func parseForm(r io.Reader) (url.Values, error) {
-	maxFormSize := int64(1<<63 - 1)
+func readPayload(r io.Reader) ([]byte, error) {
+	maxFormSize := int64(1 << 63 - 1)
 	maxFormSize = int64(10 << 20) // 10 MB is a lot of text.
 	b, err := ioutil.ReadAll(io.LimitReader(r, maxFormSize+1))
 	if err != nil {
@@ -254,7 +247,7 @@ func parseForm(r io.Reader) (url.Values, error) {
 		err = errors.New("http: POST too large")
 		return nil, err
 	}
-	return url.ParseQuery(string(b))
+	return b, nil
 }
 
 func checkHMAC(h hash.Hash, sig string) bool {
@@ -263,35 +256,51 @@ func checkHMAC(h hash.Hash, sig string) bool {
 		[]byte(got), []byte(sig)) == 1
 }
 
-func handlePost(w http.ResponseWriter, req *http.Request, bg bool) {
+func handleGitHubCallback(w http.ResponseWriter, req *http.Request, bg bool) {
 	// We're teeing the form parsing into a sha1 HMAC so we can
 	// authenticate what we actually parsed (if we *secret is set,
 	// anyway)
 	mac := hmac.New(sha1.New, []byte(*secret))
 	r := io.TeeReader(req.Body, mac)
-	form, err := parseForm(r)
+	payload, err := readPayload(r)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	b := []byte(form.Get("payload"))
 
 	if !(*secret == "" || checkHMAC(mac, req.Header.Get("X-Hub-Signature"))) {
 		http.Error(w, "not authorized", http.StatusUnauthorized)
 		return
 	}
 
-	path := getPath(req)
+	p := struct {
+			Repository struct {
+				Private  bool
+				Name     string
+				FullName string `json:"full_name"`
+			}
+		}{}
+
+	err = json.Unmarshal(payload, &p)
+	if err != nil {
+		log.Printf("Error unmarshalling data: %v", err)
+		http.Error(w, "Error parsing JSON", http.StatusInternalServerError)
+		return
+	}
+
+	path := p.Repository.FullName
+	repo_path := p.Repository.FullName
+	private := p.Repository.Private
 
 	if exists(filepath.Join(*thePath, path)) {
-		doUpdate(w, path, bg, b)
+		doUpdate(w, path, bg, payload)
 	} else {
-		createRepo(w, path, bg, b)
+		doCreate(w, path, repo_path, private, bg, payload)
 	}
 }
 
 func handleReq(w http.ResponseWriter, req *http.Request) {
-	backgrounded := req.URL.Query().Get("bg") != "false"
+	backgrounded := req.URL.Query().Get("bg") == "true"
 
 	log.Printf("Handling %v %v", req.Method, req.URL.Path)
 
@@ -299,7 +308,13 @@ func handleReq(w http.ResponseWriter, req *http.Request) {
 	case "GET":
 		handleGet(w, req, backgrounded)
 	case "POST":
-		handlePost(w, req, backgrounded)
+		switch req.URL.Path {
+		case "/callback/github":
+			handleGitHubCallback(w, req, backgrounded)
+		default:
+			http.Error(w, "Path not found",
+				http.StatusNotFound)
+		}
 	default:
 		http.Error(w, "Method not allowed",
 			http.StatusMethodNotAllowed)
