@@ -23,6 +23,7 @@ import (
 var (
 	thePath = flag.String("dir", "/tmp", "working directory")
 	git     = flag.String("git", "/usr/bin/git", "path to git")
+	postFetch = flag.String("post-fetch", "", "post fetch script")
 	addr    = flag.String("addr", ":8124", "binding address to listen on")
 	secret  = flag.String("secret", "",
 	"Optional secret for authenticating hooks")
@@ -176,6 +177,12 @@ func updateGit(w http.ResponseWriter, section string,
 	cmds[2].Stdin = bytes.NewBuffer(payload)
 	cmds[3].Stdin = bytes.NewBuffer(payload)
 
+	if *postFetch != "" {
+		cmd := exec.Command(*postFetch)
+		cmd.Stdin = bytes.NewBuffer(payload)
+		cmds = append(cmds, cmd)
+	}
+
 	return <-queueCommand(w, bg, abspath, cmds)
 }
 
@@ -204,6 +211,10 @@ func createRepo(w http.ResponseWriter, path string, repo_path string,
 		exec.Command(filepath.Join(*thePath, "bin/post-clone")),
 		exec.Command(filepath.Join(abspath, "hooks/post-fetch")),
 		exec.Command(filepath.Join(*thePath, "bin/post-fetch")),
+	}
+
+	if *postFetch != "" {
+		cmds = append(cmds, exec.Command(*postFetch))
 	}
 
 	for i:=1; i<len(cmds); i++ {
